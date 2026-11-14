@@ -124,7 +124,7 @@ pub fn format_hotkey(bind: Option<KeyBind>, lang: Language) -> String {
         .unwrap_or_else(|| String::from(lang.tr("НЕТ", "NONE")))
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HotkeyConfig {
     pub toggle_hidden: Option<KeyBind>,
     pub toggle_click_through: Option<KeyBind>,
@@ -385,7 +385,7 @@ impl StatsVisibility {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ThresholdConfig {
     pub temp_warn_c: f32,
     pub temp_crit_c: f32,
@@ -505,7 +505,8 @@ pub fn render_settings_viewport(
         .with_always_on_top()
         .with_transparent(true)
         .with_decorations(true)
-        .with_resizable(true);
+        .with_resizable(true)
+        .with_taskbar(false);
 
     ctx.show_viewport_immediate(viewport_id, builder, |v_ctx, _class| {
         if v_ctx.input(|i| i.viewport().close_requested()) {

@@ -141,7 +141,7 @@ pub struct ThemeColors {
     pub accent: Color32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ThemeConfig {
     pub preset: ThemePreset,
     pub bg_opacity: f32,

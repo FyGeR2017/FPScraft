@@ -27,7 +27,7 @@ fn main() -> eframe::Result {
         .with_transparent(true)
         .with_always_on_top()
         .with_resizable(false)
-        .with_taskbar(true);
+        .with_taskbar(false);
 
     let options = eframe::NativeOptions {
         viewport,

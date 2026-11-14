@@ -49,6 +49,8 @@ pub struct OverlayApp {
     watcher_state: Arc<Mutex<HiddenWatcherState>>,
     tray: Option<Tray>,
     autostart_enabled: bool,
+    last_saved_settings: config::PersistedSettings,
+    dirty_since: Option<Instant>,
 }
 
 impl OverlayApp {
@@ -58,9 +60,8 @@ impl OverlayApp {
         configure_visuals(&cc.egui_ctx);
 
         let mut settings = OverlaySettings::default();
-        if let Some(lang) = config::load_language() {
-            settings.lang = lang;
-        }
+        config::load_settings(&mut settings);
+        let last_saved_settings = config::PersistedSettings::from_settings(&settings);
         let initial_hwnd = extract_win32_hwnd(cc);
         let watcher_state = Arc::new(Mutex::new(HiddenWatcherState {
             hwnd: initial_hwnd,
@@ -88,6 +89,8 @@ impl OverlayApp {
             watcher_state,
             tray,
             autostart_enabled,
+            last_saved_settings,
+            dirty_since: None,
         }
     }
 
@@ -301,6 +304,7 @@ impl eframe::App for OverlayApp {
         }
 
         if self.hidden {
+            self.persist_settings_if_dirty(false);
             // Keep the tray menu responsive while the overlay window is hidden.
             ctx.request_repaint_after(Duration::from_millis(120));
             return;
@@ -397,11 +401,35 @@ impl eframe::App for OverlayApp {
             });
 
         self.sync_viewport_size(ctx, measured_size);
+        self.persist_settings_if_dirty(false);
         ctx.request_repaint_after(Duration::from_millis(16));
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.persist_settings_if_dirty(true);
     }
 }
 
 impl OverlayApp {
+    fn persist_settings_if_dirty(&mut self, force: bool) {
+        let current = config::PersistedSettings::from_settings(&self.settings);
+        if current == self.last_saved_settings {
+            self.dirty_since = None;
+            return;
+        }
+        let should_save = force
+            || self
+                .dirty_since
+                .is_some_and(|t| t.elapsed() >= Duration::from_millis(300));
+        if should_save {
+            let _ = config::save_settings(&self.settings);
+            self.last_saved_settings = current;
+            self.dirty_since = None;
+        } else if self.dirty_since.is_none() {
+            self.dirty_since = Some(Instant::now());
+        }
+    }
+
     fn render_full(
         &mut self,
         ui: &mut egui::Ui,
