@@ -18,6 +18,7 @@ pub struct PersistedSettings {
     pub lang: Language,
     pub mode: OverlayMode,
     pub corner: Corner,
+    pub custom_pos: Option<[f32; 2]>,
     pub theme: ThemeConfig,
     pub stats: StatsVisibility,
     pub hotkeys: HotkeyConfig,
@@ -30,6 +31,7 @@ impl PersistedSettings {
             lang: s.lang,
             mode: s.mode,
             corner: s.corner,
+            custom_pos: s.custom_pos,
             theme: s.theme.clone(),
             stats: s.stats.clone(),
             hotkeys: s.hotkeys.clone(),
@@ -157,6 +159,10 @@ fn serialize_settings(s: &OverlaySettings) -> String {
             Corner::BottomLeft => "bottom_left",
         }
     ));
+    lines.push(match s.custom_pos {
+        Some([x, y]) => format!("custom_pos={x:.1},{y:.1}"),
+        None => String::from("custom_pos=none"),
+    });
 
     lines.push(format!(
         "theme.preset={}",
@@ -293,6 +299,17 @@ fn apply_config_str(s: &mut OverlaySettings, text: &str) -> bool {
                 "bottom_left" => s.corner = Corner::BottomLeft,
                 _ => {}
             },
+            "custom_pos" => {
+                if val == "none" {
+                    s.custom_pos = None;
+                } else if let Some((xs, ys)) = val.split_once(',') {
+                    if let (Ok(x), Ok(y)) = (xs.trim().parse::<f32>(), ys.trim().parse::<f32>()) {
+                        if x.is_finite() && y.is_finite() {
+                            s.custom_pos = Some([x, y]);
+                        }
+                    }
+                }
+            }
             "theme.preset" => match val {
                 "graphite" => s.theme.preset = ThemePreset::Graphite,
                 "oled_black" => s.theme.preset = ThemePreset::OledBlack,

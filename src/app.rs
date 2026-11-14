@@ -51,6 +51,9 @@ pub struct OverlayApp {
     autostart_enabled: bool,
     last_saved_settings: config::PersistedSettings,
     dirty_since: Option<Instant>,
+    initial_pos_applied: bool,
+    last_known_pos: Option<Pos2>,
+    programmatic_move_frames: u8,
 }
 
 impl OverlayApp {
@@ -91,6 +94,9 @@ impl OverlayApp {
             autostart_enabled,
             last_saved_settings,
             dirty_since: None,
+            initial_pos_applied: false,
+            last_known_pos: None,
+            programmatic_move_frames: 0,
         }
     }
 
@@ -182,6 +188,7 @@ impl OverlayApp {
         }
         if self.poller.is_edge_pressed(hk.cycle_corner) {
             self.settings.corner = self.settings.corner.next();
+            self.settings.custom_pos = None;
             self.apply_corner_position(ctx);
         }
         if self.poller.is_edge_pressed(hk.toggle_settings) {
@@ -217,15 +224,14 @@ impl OverlayApp {
         }
     }
 
-    fn set_mode(&mut self, ctx: &egui::Context, mode: OverlayMode) {
+    fn set_mode(&mut self, _ctx: &egui::Context, mode: OverlayMode) {
         if self.settings.mode != mode {
             self.settings.mode = mode;
             self.last_viewport_size = Vec2::ZERO;
-            self.apply_corner_position(ctx);
         }
     }
 
-    fn apply_corner_position(&self, ctx: &egui::Context) {
+    fn apply_corner_position(&mut self, ctx: &egui::Context) {
         let monitor_size = ctx
             .input(|i| i.viewport().monitor_size)
             .unwrap_or(Vec2::new(1920.0, 1080.0));
@@ -235,6 +241,7 @@ impl OverlayApp {
             Vec2::new(FULL_WIDTH * self.settings.theme.ui_scale, 28.0)
         };
         let pos = self.settings.corner.position(monitor_size, win_size);
+        self.programmatic_move_frames = 3;
         ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos));
     }
 
@@ -245,7 +252,7 @@ impl OverlayApp {
         {
             self.last_viewport_size = rounded;
             ctx.send_viewport_cmd(ViewportCommand::InnerSize(rounded));
-            if self.settings.corner != Corner::TopLeft {
+            if self.settings.custom_pos.is_none() && self.settings.corner != Corner::TopLeft {
                 self.apply_corner_position(ctx);
             }
         }
@@ -263,6 +270,21 @@ impl eframe::App for OverlayApp {
         self.last_frame_instant = now;
 
         self.ensure_overlay_hwnd(frame);
+
+        if !self.initial_pos_applied {
+            self.initial_pos_applied = true;
+            if let Some([x, y]) = self.settings.custom_pos {
+                let mut pos = Pos2::new(x, y);
+                if let Some(monitor) = ctx.input(|i| i.viewport().monitor_size) {
+                    pos.x = pos.x.clamp(0.0, (monitor.x - 40.0).max(0.0));
+                    pos.y = pos.y.clamp(0.0, (monitor.y - 20.0).max(0.0));
+                }
+                self.programmatic_move_frames = 3;
+                ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos));
+            } else if self.settings.corner != Corner::TopLeft {
+                self.apply_corner_position(ctx);
+            }
+        }
 
         // The watcher thread un-hides the overlay while the window receives no input, so the
         // mouse passthrough state is restored here, on the UI thread, in the very frame that
@@ -298,8 +320,8 @@ impl eframe::App for OverlayApp {
         }
         if settings_actions.mode_changed {
             self.last_viewport_size = Vec2::ZERO;
-            self.apply_corner_position(ctx);
         } else if settings_actions.corner_changed {
+            self.settings.custom_pos = None;
             self.apply_corner_position(ctx);
         }
 
@@ -341,6 +363,7 @@ impl eframe::App for OverlayApp {
         egui::CentralPanel::default()
             .frame(Frame::NONE)
             .show(ctx, |ui| {
+                ui.style_mut().interaction.selectable_labels = false;
                 match mode {
                     OverlayMode::Full => {
                         let mut header_bottom = 0.0_f32;
@@ -401,6 +424,21 @@ impl eframe::App for OverlayApp {
             });
 
         self.sync_viewport_size(ctx, measured_size);
+        let outer_pos = ctx.input(|i| i.viewport().outer_rect).map(|r| r.min);
+        if self.programmatic_move_frames > 0 {
+            self.programmatic_move_frames -= 1;
+            if let Some(pos) = outer_pos {
+                self.last_known_pos = Some(pos);
+            }
+        } else if let Some(pos) = outer_pos {
+            if self
+                .last_known_pos
+                .is_some_and(|prev| (prev.x - pos.x).abs() > 1.0 || (prev.y - pos.y).abs() > 1.0)
+            {
+                self.settings.custom_pos = Some([pos.x, pos.y]);
+            }
+            self.last_known_pos = Some(pos);
+        }
         self.persist_settings_if_dirty(false);
         ctx.request_repaint_after(Duration::from_millis(16));
     }
