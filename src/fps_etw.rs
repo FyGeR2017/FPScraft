@@ -1,16 +1,18 @@
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use windows_sys::core::GUID;
-use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_SUCCESS, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{
+    ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, INVALID_HANDLE_VALUE,
+};
 use windows_sys::Win32::System::Diagnostics::Etw::{
     CloseTrace, ControlTraceW, EnableTraceEx2, OpenTraceW, ProcessTrace, StartTraceW,
-    CONTROLTRACE_HANDLE, EVENT_CONTROL_CODE_ENABLE_PROVIDER, EVENT_RECORD,
-    EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES,
-    EVENT_TRACE_REAL_TIME_MODE, PROCESS_TRACE_MODE_EVENT_RECORD, PROCESS_TRACE_MODE_REAL_TIME,
-    TRACE_LEVEL_INFORMATION, WNODE_FLAG_TRACED_GUID,
+    CONTROLTRACE_HANDLE, EVENT_CONTROL_CODE_ENABLE_PROVIDER, EVENT_HEADER_FLAG_32_BIT_HEADER,
+    EVENT_HEADER_FLAG_64_BIT_HEADER, EVENT_RECORD, EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_LOGFILEW,
+    EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE, PROCESS_TRACE_MODE_EVENT_RECORD,
+    PROCESS_TRACE_MODE_REAL_TIME, TRACE_LEVEL_INFORMATION, WNODE_FLAG_TRACED_GUID,
 };
 use windows_sys::Win32::System::Performance::QueryPerformanceFrequency;
 
@@ -22,8 +24,32 @@ const D3D9_PROVIDER: GUID = GUID::from_u128(0x783ACA0A_790E_4D7F_8451_AA850511C6
 const DXGI_PRESENT_START_ID: u16 = 42;
 const D3D9_PRESENT_START_ID: u16 = 1;
 
+const DXGI_PRESENT_TEST: u32 = 0x0000_0001;
+const DXGI_PRESENT_DO_NOT_SEQUENCE: u32 = 0x0000_0002;
+
 const SESSION_NAME: &str = "FPScraft_DXGI_Trace";
 const MAX_TIMESTAMPS: usize = 512;
+const MAX_SWAPCHAINS: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum EtwStatus {
+    Starting = 0,
+    Active = 1,
+    AccessDenied = 2,
+    Failed = 3,
+}
+
+impl EtwStatus {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Active,
+            2 => Self::AccessDenied,
+            3 => Self::Failed,
+            _ => Self::Starting,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct EtwFpsSample {
@@ -35,8 +61,10 @@ pub struct EtwFpsSample {
 struct SharedEtwState {
     target_pid: AtomicU32,
     active: AtomicBool,
+    status: AtomicU8,
     qpc_freq: i64,
-    timestamps: Mutex<VecDeque<i64>>,
+    /// Per-swapchain (`pIDXGISwapChain` or `0` for D3D9) QPC timestamps.
+    swapchains: Mutex<HashMap<u64, VecDeque<i64>>>,
 }
 
 static GLOBAL_STATE: Mutex<Option<Arc<SharedEtwState>>> = Mutex::new(None);
@@ -56,8 +84,9 @@ impl EtwFpsTracker {
         let state = Arc::new(SharedEtwState {
             target_pid: AtomicU32::new(0),
             active: AtomicBool::new(false),
+            status: AtomicU8::new(EtwStatus::Starting as u8),
             qpc_freq: freq.max(1),
-            timestamps: Mutex::new(VecDeque::with_capacity(MAX_TIMESTAMPS)),
+            swapchains: Mutex::new(HashMap::with_capacity(MAX_SWAPCHAINS)),
         });
 
         if let Ok(mut guard) = GLOBAL_STATE.lock() {
@@ -70,11 +99,15 @@ impl EtwFpsTracker {
         Self { state }
     }
 
+    pub fn status(&self) -> EtwStatus {
+        EtwStatus::from_u8(self.state.status.load(Ordering::Relaxed))
+    }
+
     pub fn set_target_pid(&self, pid: u32) {
         let prev = self.state.target_pid.swap(pid, Ordering::Relaxed);
         if prev != pid {
-            if let Ok(mut ts) = self.state.timestamps.lock() {
-                ts.clear();
+            if let Ok(mut sc) = self.state.swapchains.lock() {
+                sc.clear();
             }
         }
     }
@@ -83,21 +116,27 @@ impl EtwFpsTracker {
         if !self.state.active.load(Ordering::Relaxed) {
             return None;
         }
-        let Ok(ts) = self.state.timestamps.lock() else {
+        let Ok(sc) = self.state.swapchains.lock() else {
             return None;
         };
-        if ts.len() < 2 {
+        if sc.is_empty() {
             return None;
         }
 
         let freq = self.state.qpc_freq as f64;
-        let newest = *ts.back()?;
-        // Keep only frames within the last 1.5 seconds.
-        let cutoff = newest - (freq * 1.5) as i64;
-        let recent: Vec<i64> = ts.iter().copied().filter(|&t| t >= cutoff).collect();
-        if recent.len() < 2 {
-            return None;
-        }
+        let window_ticks = (freq * 1.5) as i64;
+
+        // Pick the swapchain with the most recent frames in the last 1.5s so secondary
+        // UI/overlay swapchains in the same process never double-count the main game FPS.
+        let recent = sc
+            .values()
+            .filter_map(|ts| {
+                let newest = *ts.back()?;
+                let cutoff = newest - window_ticks;
+                let recent: Vec<i64> = ts.iter().copied().filter(|&t| t >= cutoff).collect();
+                (recent.len() >= 2).then_some(recent)
+            })
+            .max_by_key(|r| (r.len(), *r.last().unwrap_or(&0)))?;
 
         let mut deltas_ms: Vec<f32> = recent
             .windows(2)
@@ -178,6 +217,12 @@ fn run_etw_session(state: Arc<SharedEtwState>) {
         )
     };
     if status != ERROR_SUCCESS && status != ERROR_ALREADY_EXISTS {
+        let next = if status == ERROR_ACCESS_DENIED {
+            EtwStatus::AccessDenied
+        } else {
+            EtwStatus::Failed
+        };
+        state.status.store(next as u8, Ordering::Relaxed);
         return;
     }
 
@@ -215,10 +260,16 @@ fn run_etw_session(state: Arc<SharedEtwState>) {
     // SAFETY: logfile is properly initialized with a valid logger name and callback.
     let trace_handle = unsafe { OpenTraceW(&mut logfile) };
     if trace_handle.Value == INVALID_HANDLE_VALUE as u64 {
+        state
+            .status
+            .store(EtwStatus::Failed as u8, Ordering::Relaxed);
         return;
     }
 
     state.active.store(true, Ordering::Relaxed);
+    state
+        .status
+        .store(EtwStatus::Active as u8, Ordering::Relaxed);
     let handles = [trace_handle];
     // SAFETY: ProcessTrace blocks on the valid trace_handle until the session stops.
     unsafe {
@@ -254,7 +305,48 @@ unsafe extern "system" fn event_record_callback(event: *mut EVENT_RECORD) {
         return;
     }
 
-    if let Ok(mut ts) = state.timestamps.try_lock() {
+    let swapchain_key = if is_dxgi_present {
+        let ptr_size = if (rec.EventHeader.Flags & EVENT_HEADER_FLAG_64_BIT_HEADER as u16) != 0 {
+            8usize
+        } else if (rec.EventHeader.Flags & EVENT_HEADER_FLAG_32_BIT_HEADER as u16) != 0 {
+            4usize
+        } else {
+            std::mem::size_of::<usize>()
+        };
+        if rec.UserData.is_null() || (rec.UserDataLength as usize) < ptr_size + 4 {
+            0
+        } else {
+            // SAFETY: UserData is valid for UserDataLength bytes during the ETW callback.
+            let data =
+                unsafe { std::slice::from_raw_parts(rec.UserData as *const u8, rec.UserDataLength as usize) };
+            let flags = u32::from_ne_bytes([
+                data[ptr_size],
+                data[ptr_size + 1],
+                data[ptr_size + 2],
+                data[ptr_size + 3],
+            ]);
+            if (flags & (DXGI_PRESENT_TEST | DXGI_PRESENT_DO_NOT_SEQUENCE)) != 0 {
+                return;
+            }
+            if ptr_size == 8 {
+                u64::from_ne_bytes([
+                    data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+                ])
+            } else {
+                u32::from_ne_bytes([data[0], data[1], data[2], data[3]]) as u64
+            }
+        }
+    } else {
+        0
+    };
+
+    if let Ok(mut sc) = state.swapchains.try_lock() {
+        if !sc.contains_key(&swapchain_key) && sc.len() >= MAX_SWAPCHAINS {
+            return;
+        }
+        let ts = sc
+            .entry(swapchain_key)
+            .or_insert_with(|| VecDeque::with_capacity(MAX_TIMESTAMPS));
         if ts.len() >= MAX_TIMESTAMPS {
             ts.pop_front();
         }

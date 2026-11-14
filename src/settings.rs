@@ -419,6 +419,7 @@ pub enum SettingsTab {
 }
 
 /// Complete runtime configuration shared between the overlay and the Settings viewport.
+#[derive(Clone)]
 pub struct OverlaySettings {
     pub open: bool,
     pub lang: Language,

@@ -5,6 +5,7 @@ mod autostart;
 mod config;
 mod fps_etw;
 mod metrics;
+mod sensors_win;
 mod settings;
 mod theme;
 mod tray;
@@ -44,16 +45,30 @@ fn main() -> eframe::Result {
 
 /// Keeps a second launch from creating a duplicate tray icon / overlay.
 fn acquire_single_instance() -> bool {
-    use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
     use windows_sys::Win32::System::Threading::CreateMutexW;
 
+    let restarting = std::env::args().any(|a| a == "--restarting");
+    let attempts = if restarting { 20 } else { 1 };
     let name: Vec<u16> = "FpscraftOverlayMutex\0".encode_utf16().collect();
-    // SAFETY: the name is a valid NUL-terminated UTF-16 string; a null security
-    // descriptor means the default per-user security attributes.
-    let handle = unsafe { CreateMutexW(std::ptr::null(), 1, name.as_ptr()) };
-    if handle.is_null() {
-        return true;
+
+    for i in 0..attempts {
+        // SAFETY: the name is a valid NUL-terminated UTF-16 string; a null security
+        // descriptor means the default per-user security attributes.
+        let handle = unsafe { CreateMutexW(std::ptr::null(), 1, name.as_ptr()) };
+        if handle.is_null() {
+            return true;
+        }
+        // SAFETY: GetLastError reads the calling thread's last-error value.
+        let exists = unsafe { GetLastError() == ERROR_ALREADY_EXISTS };
+        if !exists {
+            return true;
+        }
+        // SAFETY: handle is non-null and owned by this failed acquisition attempt.
+        unsafe { CloseHandle(handle) };
+        if i + 1 < attempts {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
     }
-    // SAFETY: GetLastError reads the calling thread's last-error value.
-    unsafe { GetLastError() != ERROR_ALREADY_EXISTS }
+    false
 }

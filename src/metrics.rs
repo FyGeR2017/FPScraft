@@ -16,7 +16,8 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
-use crate::fps_etw::EtwFpsTracker;
+use crate::fps_etw::{EtwFpsTracker, EtwStatus};
+use crate::sensors_win::{read_aida64_shared_memory, read_hwinfo_shared_memory, PdhSensors};
 
 #[derive(Debug, Clone, Copy)]
 struct ExternalFpsSample {
@@ -40,6 +41,7 @@ pub struct MetricsSnapshot {
     pub frametime_ms: f32,
     pub fps_history: Vec<f32>,
     pub fps_source: &'static str,
+    pub etw_access_denied: bool,
     pub active_app: String,
 
     // CPU metrics
@@ -82,6 +84,7 @@ impl Default for MetricsSnapshot {
             frametime_ms: 0.0,
             fps_history: Vec::with_capacity(FRAMETIME_HISTORY_LEN),
             fps_source: "Overlay",
+            etw_access_denied: false,
             active_app: String::from("Desktop"),
             cpu_name: String::from("CPU"),
             cpu_usage: 0.0,
@@ -136,6 +139,7 @@ pub struct MetricsCollector {
     last_sensor_poll: Instant,
     external_fps: Option<ExternalFpsSample>,
     etw_fps: EtwFpsTracker,
+    pdh_sensors: Option<PdhSensors>,
     foreground_pid: u32,
 }
 
@@ -179,6 +183,7 @@ impl MetricsCollector {
             last_sensor_poll: Instant::now(),
             external_fps: None,
             etw_fps: EtwFpsTracker::start(),
+            pdh_sensors: PdhSensors::new(),
             foreground_pid: 0,
         };
 
@@ -324,6 +329,8 @@ impl MetricsCollector {
                     source: "DXGI",
                 })
             });
+        self.snapshot.etw_access_denied =
+            self.external_fps.is_none() && self.etw_fps.status() == EtwStatus::AccessDenied;
 
         // CPU telemetry
         let sys_cpu_usage = self.sys.global_cpu_usage();
@@ -340,9 +347,45 @@ impl MetricsCollector {
             .first()
             .map(|c| c.frequency() as u32)
             .unwrap_or(0);
-        self.snapshot.cpu_clock_mhz = mahm.cpu_clock_mhz.unwrap_or(fallback_clock);
-        self.snapshot.cpu_power_w = mahm.cpu_power_w;
-        self.snapshot.cpu_temp_c = mahm.cpu_temp_c.or_else(|| self.read_fallback_cpu_temp());
+        let pdh = self
+            .pdh_sensors
+            .as_mut()
+            .map(|p| p.poll(fallback_clock))
+            .unwrap_or_default();
+        let hwinfo = if mahm.cpu_temp_c.is_none()
+            || mahm.cpu_power_w.is_none()
+            || mahm.cpu_clock_mhz.is_none()
+        {
+            read_hwinfo_shared_memory().unwrap_or_default()
+        } else {
+            Default::default()
+        };
+        let aida = if (mahm.cpu_temp_c.is_none() && hwinfo.cpu_temp_c.is_none())
+            || (mahm.cpu_power_w.is_none() && hwinfo.cpu_power_w.is_none())
+            || (mahm.cpu_clock_mhz.is_none() && hwinfo.cpu_clock_mhz.is_none())
+        {
+            read_aida64_shared_memory().unwrap_or_default()
+        } else {
+            Default::default()
+        };
+
+        self.snapshot.cpu_clock_mhz = mahm
+            .cpu_clock_mhz
+            .or(hwinfo.cpu_clock_mhz)
+            .or(aida.cpu_clock_mhz)
+            .or(pdh.cpu_clock_mhz)
+            .unwrap_or(fallback_clock);
+        self.snapshot.cpu_power_w = mahm
+            .cpu_power_w
+            .or(hwinfo.cpu_power_w)
+            .or(aida.cpu_power_w)
+            .or(pdh.cpu_power_w);
+        self.snapshot.cpu_temp_c = mahm
+            .cpu_temp_c
+            .or(hwinfo.cpu_temp_c)
+            .or(aida.cpu_temp_c)
+            .or(pdh.cpu_temp_c)
+            .or_else(|| self.read_fallback_cpu_temp());
 
         // GPU telemetry (NVML primary, MAHM fallback)
         self.refresh_gpu_sensors(&mahm);

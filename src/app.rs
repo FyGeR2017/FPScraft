@@ -1,4 +1,6 @@
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -47,7 +49,10 @@ pub struct OverlayApp {
     overlay_hwnd: isize,
     last_applied_alpha: u8,
     watcher_state: Arc<Mutex<HiddenWatcherState>>,
-    tray: Option<Tray>,
+    tray: Rc<RefCell<Option<Tray>>>,
+    pending_tray_actions: Rc<RefCell<Vec<TrayAction>>>,
+    pending_exit_save: Rc<RefCell<Option<OverlaySettings>>>,
+    tray_open_settings: Rc<Cell<bool>>,
     autostart_enabled: bool,
     last_saved_settings: config::PersistedSettings,
     dirty_since: Option<Instant>,
@@ -76,7 +81,86 @@ impl OverlayApp {
         spawn_unhide_watcher(cc.egui_ctx.clone(), Arc::clone(&watcher_state));
 
         let autostart_enabled = autostart::is_enabled();
-        let tray = Tray::new(settings.lang, false, autostart_enabled);
+        let tray = Rc::new(RefCell::new(Tray::new(
+            cc.egui_ctx.clone(),
+            settings.lang,
+            false,
+            autostart_enabled,
+        )));
+        let pending_tray_actions = Rc::new(RefCell::new(Vec::new()));
+        let pending_exit_save = Rc::new(RefCell::new(None));
+        let tray_open_settings = Rc::new(Cell::new(false));
+
+        {
+            let tray_cb = Rc::clone(&tray);
+            let actions_cb = Rc::clone(&pending_tray_actions);
+            let exit_save_cb = Rc::clone(&pending_exit_save);
+            let open_settings_cb = Rc::clone(&tray_open_settings);
+            let watcher_cb = Arc::clone(&watcher_state);
+            let ctx_cb = cc.egui_ctx.clone();
+            Tray::set_wake_callback(move || {
+                let is_quit = tray_cb
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(Tray::is_quit_requested);
+                if is_quit {
+                    immediate_quit(&tray_cb, &exit_save_cb);
+                }
+
+                let drained = tray_cb
+                    .borrow_mut()
+                    .as_mut()
+                    .map(Tray::poll)
+                    .unwrap_or_default();
+
+                let mut wake_hidden = false;
+                let mut open_settings_now = false;
+                for action in drained {
+                    match action {
+                        TrayAction::Quit => immediate_quit(&tray_cb, &exit_save_cb),
+                        TrayAction::RestartAsAdmin => {
+                            if launch_elevated_self() {
+                                immediate_quit(&tray_cb, &exit_save_cb);
+                            }
+                        }
+                        TrayAction::ToggleOverlay => {
+                            let is_hidden = watcher_cb.lock().map(|st| st.hidden).unwrap_or(false);
+                            if is_hidden {
+                                wake_hidden = true;
+                            } else {
+                                actions_cb.borrow_mut().push(action);
+                            }
+                        }
+                        TrayAction::OpenSettings => {
+                            let is_hidden = watcher_cb.lock().map(|st| st.hidden).unwrap_or(false);
+                            if is_hidden {
+                                open_settings_now = true;
+                                wake_hidden = true;
+                            } else {
+                                actions_cb.borrow_mut().push(action);
+                            }
+                        }
+                        other => actions_cb.borrow_mut().push(other),
+                    }
+                }
+
+                if open_settings_now {
+                    open_settings_cb.set(true);
+                }
+                if wake_hidden {
+                    if let Ok(mut st) = watcher_cb.lock() {
+                        st.hidden = false;
+                        if st.hwnd != 0 {
+                            // SAFETY: st.hwnd is a valid Win32 handle for FPScraft Overlay.
+                            unsafe {
+                                ShowWindow(st.hwnd as HWND, SW_SHOWNA);
+                            }
+                        }
+                    }
+                    ctx_cb.request_repaint();
+                }
+            });
+        }
 
         Self {
             collector: MetricsCollector::new(),
@@ -91,6 +175,9 @@ impl OverlayApp {
             last_applied_alpha: 255,
             watcher_state,
             tray,
+            pending_tray_actions,
+            pending_exit_save,
+            tray_open_settings,
             autostart_enabled,
             last_saved_settings,
             dirty_since: None,
@@ -204,14 +291,12 @@ impl OverlayApp {
 
     fn quit_app(&mut self, _ctx: &egui::Context) {
         self.persist_settings_if_dirty(true);
-        self.tray.take();
-        // SAFETY: Settings are already flushed and the tray icon is dropped; TerminateProcess
-        // avoids DllMain/atexit deadlocks with OpenGL/NVML/winit during shutdown.
-        unsafe {
-            windows_sys::Win32::System::Threading::TerminateProcess(
-                windows_sys::Win32::System::Threading::GetCurrentProcess(),
-                0,
-            );
+        immediate_quit(&self.tray, &self.pending_exit_save);
+    }
+
+    fn restart_as_admin(&mut self, ctx: &egui::Context) {
+        if launch_elevated_self() {
+            self.quit_app(ctx);
         }
     }
 
@@ -230,6 +315,9 @@ impl OverlayApp {
                     Ok(()) => enable,
                     Err(_) => autostart::is_enabled(),
                 };
+            }
+            TrayAction::RestartAsAdmin => {
+                self.restart_as_admin(ctx);
             }
             TrayAction::Quit => {
                 self.quit_app(ctx);
@@ -278,6 +366,18 @@ impl eframe::App for OverlayApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        if self
+            .tray
+            .borrow()
+            .as_ref()
+            .is_some_and(Tray::is_quit_requested)
+        {
+            self.quit_app(ctx);
+        }
+        if self.tray_open_settings.replace(false) {
+            self.settings.open = true;
+        }
+
         let now = Instant::now();
         let dt = now.duration_since(self.last_frame_instant).as_secs_f32();
         self.last_frame_instant = now;
@@ -318,11 +418,20 @@ impl eframe::App for OverlayApp {
 
         self.handle_global_hotkeys(ctx);
 
-        if let Some(action) = self.tray.as_mut().and_then(Tray::poll) {
+        let mut tray_actions: Vec<TrayAction> = self.pending_tray_actions.borrow_mut().drain(..).collect();
+        if let Some(polled) = self.tray.borrow_mut().as_mut().map(Tray::poll) {
+            tray_actions.extend(polled);
+        }
+        for action in tray_actions {
             self.handle_tray_action(ctx, action);
         }
-        if let Some(tray) = self.tray.as_mut() {
-            tray.sync(self.settings.lang, self.hidden, self.autostart_enabled);
+        if let Some(tray) = self.tray.borrow_mut().as_mut() {
+            tray.sync(
+                self.settings.lang,
+                self.hidden,
+                self.autostart_enabled,
+                self.collector.snapshot().etw_access_denied,
+            );
         }
 
         self.collector.on_frame(dt);
@@ -466,6 +575,7 @@ impl OverlayApp {
         let current = config::PersistedSettings::from_settings(&self.settings);
         if current == self.last_saved_settings {
             self.dirty_since = None;
+            *self.pending_exit_save.borrow_mut() = None;
             return;
         }
         let should_save = force
@@ -476,8 +586,12 @@ impl OverlayApp {
             let _ = config::save_settings(&self.settings);
             self.last_saved_settings = current;
             self.dirty_since = None;
-        } else if self.dirty_since.is_none() {
-            self.dirty_since = Some(Instant::now());
+            *self.pending_exit_save.borrow_mut() = None;
+        } else {
+            *self.pending_exit_save.borrow_mut() = Some(self.settings.clone());
+            if self.dirty_since.is_none() {
+                self.dirty_since = Some(Instant::now());
+            }
         }
     }
 
@@ -526,7 +640,19 @@ impl OverlayApp {
                         );
                         ui.vertical(|ui| {
                             ui.add_space(13.0 * scale);
-                            ui.label(RichText::new("FPS").size(f_small).color(TEXT_MUTED));
+                            if snap.etw_access_denied {
+                                ui.label(
+                                    RichText::new("UI")
+                                        .size(f_small)
+                                        .color(crate::theme::SIGNAL_WARN),
+                                )
+                                .on_hover_text(lang.tr(
+                                    "Показан FPS оверлея: для FPS игры перезапустите от администратора (меню трея) или включите RTSS",
+                                    "Showing overlay FPS: restart as Administrator (tray menu) or enable RTSS for game FPS",
+                                ));
+                            } else {
+                                ui.label(RichText::new("FPS").size(f_small).color(TEXT_MUTED));
+                            }
                         });
                     });
                 }
@@ -632,7 +758,13 @@ impl OverlayApp {
                             ),
                             None => (String::from("N/A"), TEXT_MUTED),
                         };
-                        ui.label(RichText::new(txt).size(f_medium).color(col));
+                        let resp = ui.label(RichText::new(txt).size(f_medium).color(col));
+                        if snap.cpu_temp_c.is_none() {
+                            resp.on_hover_text(lang.tr(
+                                "Windows не отдаёт температуру CPU без драйвера. Запустите MSI Afterburner, HWiNFO64 (Shared Memory) или AIDA64",
+                                "Windows does not expose desktop CPU temp without a driver. Run MSI Afterburner, HWiNFO64 (Shared Memory), or AIDA64",
+                            ));
+                        }
                     }
                 });
             });
@@ -1045,7 +1177,12 @@ impl OverlayApp {
                                 .size(f_val)
                                 .color(value_fps_color(snap.fps)),
                         );
-                        ui.label(RichText::new("FPS").size(f_lbl).color(TEXT_MUTED));
+                        let (fps_lbl, fps_col) = if snap.etw_access_denied {
+                            ("UI", crate::theme::SIGNAL_WARN)
+                        } else {
+                            ("FPS", TEXT_MUTED)
+                        };
+                        ui.label(RichText::new(fps_lbl).size(f_lbl).color(fps_col));
                     }
                     if stats.corner_show_1pct_low {
                         ui.label(
@@ -1618,6 +1755,49 @@ fn spawn_unhide_watcher(ctx: egui::Context, state: Arc<Mutex<HiddenWatcherState>
             }
         }
     });
+}
+
+fn immediate_quit(
+    tray: &Rc<RefCell<Option<Tray>>>,
+    pending_exit_save: &Rc<RefCell<Option<OverlaySettings>>>,
+) -> ! {
+    if let Some(settings) = pending_exit_save.borrow_mut().take() {
+        let _ = config::save_settings(&settings);
+    }
+    tray.borrow_mut().take();
+    // SAFETY: Settings are already flushed and the tray icon is dropped; TerminateProcess
+    // avoids DllMain/atexit deadlocks with OpenGL/NVML/winit during shutdown.
+    unsafe {
+        windows_sys::Win32::System::Threading::TerminateProcess(
+            windows_sys::Win32::System::Threading::GetCurrentProcess(),
+            0,
+        );
+    }
+    #[allow(clippy::empty_loop)]
+    loop {}
+}
+
+fn launch_elevated_self() -> bool {
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let to_wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
+    let verb = to_wide("runas");
+    let file = to_wide(&exe.to_string_lossy());
+    let params = to_wide("--restarting");
+
+    // SAFETY: verb, file, and params are valid NUL-terminated UTF-16 strings.
+    let res = unsafe {
+        windows_sys::Win32::UI::Shell::ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            params.as_ptr(),
+            std::ptr::null(),
+            SW_SHOWNA,
+        )
+    };
+    (res as isize) > 32
 }
 
 /// Computes the Win32 `LWA_ALPHA` byte for the overlay window.
