@@ -202,11 +202,17 @@ impl OverlayApp {
         }
     }
 
-    fn quit_app(&mut self, ctx: &egui::Context) {
+    fn quit_app(&mut self, _ctx: &egui::Context) {
         self.persist_settings_if_dirty(true);
         self.tray.take();
-        ctx.send_viewport_cmd(ViewportCommand::Close);
-        std::process::exit(0);
+        // SAFETY: Settings are already flushed and the tray icon is dropped; TerminateProcess
+        // avoids DllMain/atexit deadlocks with OpenGL/NVML/winit during shutdown.
+        unsafe {
+            windows_sys::Win32::System::Threading::TerminateProcess(
+                windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                0,
+            );
+        }
     }
 
     fn handle_tray_action(&mut self, ctx: &egui::Context, action: TrayAction) {
@@ -1386,8 +1392,12 @@ fn draw_fps_graph(
         StrokeKind::Inside,
     );
 
-    let peak_fps = history.iter().copied().fold(240.0_f32, f32::max);
-    let y_max = (peak_fps * 1.1).max(260.0);
+    let peak_fps = history.iter().copied().fold(0.0_f32, f32::max);
+    let y_max = if peak_fps <= 240.0 {
+        300.0
+    } else {
+        ((peak_fps * 1.15) / 60.0).ceil() * 60.0
+    };
     let plot_left = rect.min.x + 28.0 * scale;
     let plot_right = rect.max.x - 4.0 * scale;
     let plot_top = rect.min.y + 4.0 * scale;
@@ -1399,9 +1409,18 @@ fn draw_fps_graph(
         plot_bottom - norm * plot_h
     };
 
-    // Grid lines + scale labels (60 / 144 / 240)
-    for (ref_fps, label) in [(240.0, "240"), (144.0, "144"), (60.0, "60")] {
-        let y = y_for_fps(ref_fps);
+    // Grid lines + scale labels (60 / 144 / 240, plus top scale when > 240 FPS)
+    let mut grid_levels: Vec<(f32, String)> = vec![
+        (240.0, String::from("240")),
+        (144.0, String::from("144")),
+        (60.0, String::from("60")),
+    ];
+    if y_max > 300.0 {
+        let top_mark = (y_max - 60.0).max(360.0);
+        grid_levels.insert(0, (top_mark, format!("{:.0}", top_mark)));
+    }
+    for (ref_fps, label) in &grid_levels {
+        let y = y_for_fps(*ref_fps);
         painter.line_segment(
             [Pos2::new(plot_left, y), Pos2::new(plot_right, y)],
             Stroke::new(1.0, grid_col),
