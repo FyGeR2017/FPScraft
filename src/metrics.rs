@@ -16,6 +16,16 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
+use crate::fps_etw::EtwFpsTracker;
+
+#[derive(Debug, Clone, Copy)]
+struct ExternalFpsSample {
+    fps: f32,
+    fps_1pct_low: Option<f32>,
+    frametime_ms: Option<f32>,
+    source: &'static str,
+}
+
 const FRAMETIME_HISTORY_LEN: usize = 90;
 const SENSOR_POLL_INTERVAL_SECS: f32 = 0.5;
 const BYTES_PER_GIB: f32 = 1_073_741_824.0;
@@ -124,7 +134,9 @@ pub struct MetricsCollector {
     frametime_samples_ms: VecDeque<f32>,
     fps_samples: VecDeque<f32>,
     last_sensor_poll: Instant,
-    external_fps: Option<f32>,
+    external_fps: Option<ExternalFpsSample>,
+    etw_fps: EtwFpsTracker,
+    foreground_pid: u32,
 }
 
 impl MetricsCollector {
@@ -166,6 +178,8 @@ impl MetricsCollector {
             fps_samples: VecDeque::with_capacity(FRAMETIME_HISTORY_LEN),
             last_sensor_poll: Instant::now(),
             external_fps: None,
+            etw_fps: EtwFpsTracker::start(),
+            foreground_pid: 0,
         };
 
         collector.refresh_sensors(0.5);
@@ -229,22 +243,28 @@ impl MetricsCollector {
             (avg, low_fps)
         };
 
-        let sample_fps =
-            if let Some(ext_fps) = self.external_fps.filter(|&v| v > 0.0 && v < 10_000.0) {
-                self.snapshot.fps = ext_fps;
-                self.snapshot.fps_source = "PresentMon";
-                self.snapshot.frametime_ms = if avg_ft_ms > 0.0 {
+        let sample_fps = if let Some(ext) = self
+            .external_fps
+            .filter(|e| e.fps > 0.0 && e.fps < 10_000.0)
+        {
+            self.snapshot.fps = ext.fps;
+            self.snapshot.fps_source = ext.source;
+            self.snapshot.frametime_ms = ext.frametime_ms.unwrap_or_else(|| {
+                if avg_ft_ms > 0.0 {
                     avg_ft_ms
                 } else {
-                    1000.0 / ext_fps
-                };
-                self.snapshot.fps_1pct_low = if low_1pct_fps > 0.0 {
-                    low_1pct_fps.min(ext_fps)
+                    1000.0 / ext.fps
+                }
+            });
+            self.snapshot.fps_1pct_low = ext.fps_1pct_low.unwrap_or_else(|| {
+                if low_1pct_fps > 0.0 {
+                    low_1pct_fps.min(ext.fps)
                 } else {
-                    ext_fps
-                };
-                ext_fps
-            } else {
+                    ext.fps
+                }
+            });
+            ext.fps
+        } else {
                 let overlay_fps = if avg_ft_ms > 0.0 {
                     1000.0 / avg_ft_ms
                 } else {
@@ -281,11 +301,29 @@ impl MetricsCollector {
         self.components.refresh(true);
 
         let mahm = read_mahm_shared_memory().unwrap_or_default();
-        self.external_fps = read_msi_trace_fps();
 
-        if let Some(app) = read_foreground_process_name() {
+        if let Some((pid, app)) = read_foreground_process() {
+            self.foreground_pid = pid;
+            self.etw_fps.set_target_pid(pid);
             self.snapshot.active_app = app;
         }
+
+        self.external_fps = read_msi_trace_fps()
+            .map(|fps| ExternalFpsSample {
+                fps,
+                fps_1pct_low: None,
+                frametime_ms: None,
+                source: "PresentMon",
+            })
+            .or_else(|| read_rtss_fps(self.foreground_pid))
+            .or_else(|| {
+                self.etw_fps.sample().map(|s| ExternalFpsSample {
+                    fps: s.fps,
+                    fps_1pct_low: Some(s.fps_1pct_low),
+                    frametime_ms: Some(s.frametime_ms),
+                    source: "DXGI",
+                })
+            });
 
         // CPU telemetry
         let sys_cpu_usage = self.sys.global_cpu_usage();
@@ -575,8 +613,72 @@ fn read_msi_trace_fps() -> Option<f32> {
     }
 }
 
-/// Returns the executable file name of the current foreground window.
-fn read_foreground_process_name() -> Option<String> {
+/// Reads live FPS and frametime for `target_pid` from RivaTuner Statistics Server (`RTSSSharedMemoryV2`).
+fn read_rtss_fps(target_pid: u32) -> Option<ExternalFpsSample> {
+    if target_pid == 0 {
+        return None;
+    }
+    let wide_name: Vec<u16> = "RTSSSharedMemoryV2\0".encode_utf16().collect();
+    // SAFETY: Maps the read-only RTSS shared memory header, validates signature/version/bounds,
+    // and unmaps/closes handles before returning.
+    unsafe {
+        let handle = OpenFileMappingW(FILE_MAP_READ, 0, wide_name.as_ptr());
+        if handle.is_null() {
+            return None;
+        }
+        let view = MapViewOfFile(handle, FILE_MAP_READ, 0, 0, 0);
+        if view.Value.is_null() {
+            CloseHandle(handle);
+            return None;
+        }
+
+        let base = view.Value as *const u8;
+        let header = std::ptr::read_unaligned(base as *const [u32; 9]);
+        let signature = header[0];
+        let version = header[1];
+        let entry_size = header[2] as usize;
+        let arr_offset = header[3] as usize;
+        let arr_size = (header[4] as usize).min(256);
+
+        let mut result = None;
+        if signature == 0x5254_5353 && version >= 0x0002_0000 && entry_size >= 284 {
+            for i in 0..arr_size {
+                let entry_ptr = base.add(arr_offset + i * entry_size);
+                let pid = std::ptr::read_unaligned(entry_ptr as *const u32);
+                if pid != target_pid {
+                    continue;
+                }
+                let time0 = std::ptr::read_unaligned(entry_ptr.add(268) as *const u32);
+                let time1 = std::ptr::read_unaligned(entry_ptr.add(272) as *const u32);
+                let frames = std::ptr::read_unaligned(entry_ptr.add(276) as *const u32);
+                let frame_time_us = std::ptr::read_unaligned(entry_ptr.add(280) as *const u32);
+                let dt_ms = time1.wrapping_sub(time0);
+                if frames > 0 && dt_ms > 0 && dt_ms < 10_000 {
+                    let fps = (frames as f32 * 1000.0) / dt_ms as f32;
+                    let ft_ms = if frame_time_us > 0 {
+                        Some(frame_time_us as f32 / 1000.0)
+                    } else {
+                        Some(1000.0 / fps)
+                    };
+                    result = Some(ExternalFpsSample {
+                        fps,
+                        fps_1pct_low: None,
+                        frametime_ms: ft_ms,
+                        source: "RTSS",
+                    });
+                    break;
+                }
+            }
+        }
+
+        UnmapViewOfFile(view);
+        CloseHandle(handle);
+        result
+    }
+}
+
+/// Returns the PID and executable file name of the current foreground window.
+fn read_foreground_process() -> Option<(u32, String)> {
     // SAFETY: Win32 foreground window and process query handles are checked for null/zero
     // and closed properly.
     unsafe {
@@ -606,10 +708,11 @@ fn read_foreground_process_name() -> Option<String> {
         }
 
         let full_path = String::from_utf16_lossy(&buf[..size as usize]);
-        Path::new(&full_path)
+        let name = Path::new(&full_path)
             .file_name()
             .and_then(|n| n.to_str())
-            .map(|s| s.to_string())
+            .map(|s| s.to_string())?;
+        Some((pid, name))
     }
 }
 

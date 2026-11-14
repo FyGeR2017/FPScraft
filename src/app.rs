@@ -198,8 +198,15 @@ impl OverlayApp {
             self.help_pinned = !self.help_pinned;
         }
         if self.poller.is_edge_pressed(hk.quit_app) {
-            ctx.send_viewport_cmd(ViewportCommand::Close);
+            self.quit_app(ctx);
         }
+    }
+
+    fn quit_app(&mut self, ctx: &egui::Context) {
+        self.persist_settings_if_dirty(true);
+        self.tray.take();
+        ctx.send_viewport_cmd(ViewportCommand::Close);
+        std::process::exit(0);
     }
 
     fn handle_tray_action(&mut self, ctx: &egui::Context, action: TrayAction) {
@@ -219,7 +226,7 @@ impl OverlayApp {
                 };
             }
             TrayAction::Quit => {
-                ctx.send_viewport_cmd(ViewportCommand::Close);
+                self.quit_app(ctx);
             }
         }
     }

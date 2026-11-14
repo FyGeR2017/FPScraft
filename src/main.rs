@@ -3,6 +3,7 @@
 mod app;
 mod autostart;
 mod config;
+mod fps_etw;
 mod metrics;
 mod settings;
 mod theme;
